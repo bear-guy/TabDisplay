@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>TabDisplay</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #000;
+    touch-action: none; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+  }
+  canvas { position: absolute; left: 0; top: 0; touch-action: none; }
+  #overlay {
+    position: fixed; left: 0; top: 0; right: 0; bottom: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, .7); color: #ddd; font: 22px sans-serif; text-align: center;
+  }
+  #overlay.hidden { display: none; }
+  #hint { margin-top: 12px; font-size: 16px; color: #999; }
+  #fs {
+    position: fixed; right: 12px; bottom: 12px; z-index: 5;
+    padding: 12px 16px; border: 0; border-radius: 10px;
+    background: rgba(40, 40, 40, .75); color: #fff; font: 16px sans-serif;
+  }
+  #fs.hidden { display: none; }
+  #ring {
+    position: fixed; width: 56px; height: 56px; margin: -31px 0 0 -31px;
+    border: 3px solid rgba(255, 255, 255, .85); border-radius: 50%;
+    pointer-events: none; display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen" width="1280" height="800"></canvas>
+<div id="overlay"><div id="msg"></div><div id="hint"></div></div>
+<button id="fs" class="hidden"></button>
+<div id="ring"></div>
+<script>
+'use strict';
+
+// ---- 設定 ----
+var WS_URL = 'ws://' + location.host + '/ws';
+var TAP_SLOP = 12;       // これ以上動いたらタップではなくドラッグ（CSS px）
+var LONG_PRESS = 600;    // 長押し → 右クリック（ms）
+var DOUBLE_TAP = 400;    // ダブルクリックとみなす間隔（ms）
+var TWO_FINGER_TAP = 300;
+var SCROLL_SIGN = 1;     // スクロール方向が逆なら -1
+var FRICTION = 0.996;    // 慣性スクロールの減衰（1ms あたり）
+
+var canvas = document.getElementById('screen');
+var ctx = canvas.getContext('2d', { alpha: false });
+var overlay = document.getElementById('overlay');
+var msgEl = document.getElementById('msg');
+var hintEl = document.getElementById('hint');
+var ring = document.getElementById('ring');
+var fsButton = document.getElementById('fs');
+
+// ---- 表示言語 ----
+// Mac 側のメニューで選んだ言語が接続時に届く。届く前（Mac につながっていない間）は前回の言語を使う
+var I18N = {
+  en: {
+    connecting: 'Connecting to your Mac…',
+    connectingHint: 'Make sure TabDisplay is running on your Mac',
+    tapToStart: 'Tap to start in full screen',
+    replaced: 'Showing in another tab',
+    replacedHint: 'Tap to show it in this tab instead',
+    fullscreen: '⛶ Full screen'
+  },
+  ja: {
+    connecting: 'Mac に接続しています…',
+    connectingHint: 'TabDisplay が起動しているか確認してください',
+    tapToStart: 'タップして全画面で開始',
+    replaced: '別のタブで表示中です',
+    replacedHint: 'タップすると、このタブで表示します',
+    fullscreen: '⛶ 全画面'
+  },
+  zh: {
+    connecting: '正在连接 Mac…',
+    connectingHint: '请确认 Mac 上的 TabDisplay 正在运行',
+    tapToStart: '轻触以全屏开始',
+    replaced: '正在其他标签页中显示',
+    replacedHint: '轻触即可改为在此标签页中显示',
+    fullscreen: '⛶ 全屏'
+  },
+  es: {
+    connecting: 'Conectando con el Mac…',
+    connectingHint: 'Comprueba que TabDisplay se está ejecutando en el Mac',
+    tapToStart: 'Toca para empezar en pantalla completa',
+    replaced: 'Se está mostrando en otra pestaña',
+    replacedHint: 'Toca para mostrarla en esta pestaña',
+    fullscreen: '⛶ Pantalla completa'
+  }
+};
+var lang = 'en';
+try { lang = localStorage.getItem('lang') || 'en'; } catch (e) {}
+if (!I18N[lang]) lang = 'en';
+
+function t(key) { return I18N[lang][key]; }
+
+function setLang(l) {
+  if (!I18N[l]) return;
+  lang = l;
+  try { localStorage.setItem('lang', l); } catch (e) {}
+  document.documentElement.lang = l === 'zh' ? 'zh-Hans' : l;
+  fsButton.textContent = t('fullscreen');
+  updateOverlay();
+}
+
+var ws = null;
+var connected = false;
+var replaced = false;   // 別のタブ・端末に表示を引き継がれた
+var fullscreenTried = false;
+
+// ---- 表示 ----
+
+function layout() {
+  var vw = window.innerWidth, vh = window.innerHeight;
+  var s = Math.min(vw / canvas.width, vh / canvas.height);
+  var w = Math.round(canvas.width * s), h = Math.round(canvas.height * s);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  canvas.style.left = Math.round((vw - w) / 2) + 'px';
+  canvas.style.top = Math.round((vh - h) / 2) + 'px';
+}
+
+function isFullscreen() {
+  return !!(document.fullscreenElement || document.mozFullScreenElement);
+}
+
+function updateOverlay() {
+  if (replaced) {
+    msgEl.textContent = t('replaced');
+    hintEl.textContent = t('replacedHint');
+    overlay.className = '';
+  } else if (!connected) {
+    msgEl.textContent = t('connecting');
+    hintEl.textContent = t('connectingHint');
+    overlay.className = '';
+  } else if (!isFullscreen() && !fullscreenTried) {
+    msgEl.textContent = t('tapToStart');
+    hintEl.textContent = '';
+    overlay.className = '';
+  } else {
+    overlay.className = 'hidden';
+  }
+  // 戻るボタン等で全画面が解除されたら、すぐ戻せるようにボタンを出しておく
+  fsButton.className = (overlay.className === 'hidden' && !isFullscreen()) ? '' : 'hidden';
+}
+
+function enterFullscreen() {
+  fullscreenTried = true;
+  keepAwake();  // 自動再生が止められていても、タップ操作の中なら再生できる
+  var el = document.documentElement;
+  var req = el.requestFullscreen || el.mozRequestFullScreen;
+  if (req) {
+    var p = req.call(el);
+    if (p && p.catch) p.catch(function () {});
+  }
+  updateOverlay();
+}
+
+overlay.addEventListener('click', function () {
+  if (replaced) {
+    replaced = false;
+    updateOverlay();
+    connect();
+    return;
+  }
+  if (connected) enterFullscreen();
+});
+fsButton.addEventListener('click', enterFullscreen);
+
+// ---- 通信 ----
+
+// ?debug を付けて開くと、送ったメッセージを画面左上に表示する
+var debugEl = null;
+if (/debug/.test(location.search)) {
+  debugEl = document.createElement('pre');
+  debugEl.style.cssText = 'position:fixed;left:0;top:0;margin:0;padding:4px;z-index:9;' +
+    'background:rgba(0,0,0,.7);color:#0f0;font:12px monospace;pointer-events:none;';
+  document.body.appendChild(debugEl);
+  window.onerror = function (m, src, line) { debug('ERR ' + m + ' @' + line); };
+  ['touchmove', 'touchend', 'touchcancel', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel',
+   'contextmenu', 'mousedown', 'click', 'blur', 'visibilitychange'].forEach(function (type) {
+    var count = 0;
+    window.addEventListener(type, function (e) {
+      count++;
+      if (count <= 2 || type.indexOf('move') < 0) debug('W:' + type + ' #' + count + ' -> ' + (e.target && e.target.id || e.target && e.target.nodeName));
+    }, true);
+  });
+}
+var debugLines = [];
+function debug(s) {
+  if (!debugEl) return;
+  debugLines.push(s);
+  if (debugLines.length > 14) debugLines.shift();
+  debugEl.textContent = debugLines.join('\n');
+}
+
+function send(o) {
+  var open = ws && ws.readyState === 1;
+  if (o !== 'a') debug((open ? '' : '(not sent) ') + (typeof o === 'string' ? o : JSON.stringify(o)));
+  if (open) ws.send(typeof o === 'string' ? o : JSON.stringify(o));
+}
+
+function sendHello() {
+  send({ type: 'hello', landscape: window.innerWidth >= window.innerHeight });
+}
+
+// フレームは届いた順にデコード・描画し、描き終えたら ack を返す
+var drawChain = Promise.resolve();
+
+function onFrame(buf) {
+  var v = new DataView(buf);
+  var fw = v.getUint16(0, true), fh = v.getUint16(2, true);
+  var x = v.getUint16(4, true), y = v.getUint16(6, true);
+  var blob = new Blob([new Uint8Array(buf, 12)], { type: 'image/jpeg' });
+  var decoded = createImageBitmap(blob);
+  drawChain = drawChain.then(function () { return decoded; }).then(function (bmp) {
+    if (canvas.width !== fw || canvas.height !== fh) {
+      canvas.width = fw;
+      canvas.height = fh;
+      layout();
+    }
+    ctx.drawImage(bmp, x, y);
+    if (bmp.close) bmp.close();
+  }).catch(function () {}).then(function () { send('a'); });
+}
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = function () {
+    connected = true;
+    updateOverlay();
+    sendHello();
+  };
+  ws.onmessage = function (ev) {
+    if (typeof ev.data !== 'string') {
+      onFrame(ev.data);
+      return;
+    }
+    var msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.type === 'lang') setLang(msg.lang);
+  };
+  ws.onclose = function (ev) {
+    connected = false;
+    if (ev.code === 4000) replaced = true;
+    updateOverlay();
+    if (!replaced) setTimeout(connect, 1000);
+  };
+}
+
+var resizeTimer = 0, lastLandscape = null;
+window.addEventListener('resize', function () {
+  layout();
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(function () {
+    var landscape = window.innerWidth >= window.innerHeight;
+    if (landscape !== lastLandscape) {
+      lastLandscape = landscape;
+      sendHello();
+    }
+  }, 400);
+});
+document.addEventListener('fullscreenchange', updateOverlay);
+document.addEventListener('mozfullscreenchange', updateOverlay);
+// 通知パネルを開いた・アプリを切り替えた等でタッチが途切れたら、押しっぱなしを解除する
+window.addEventListener('blur', function () { stopMomentum(); resetGesture(); });
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) { stopMomentum(); resetGesture(); }
+});
+
+// ---- タッチ → マウス ----
+//  1本指タップ        → 左クリック（素早く2回でダブルクリック）
+//  1本指で動かす      → 左ドラッグ
+//  1本指で長押し      → 右クリック
+//  2本指で動かす      → スクロール（離すと慣性）
+//  2本指タップ        → 右クリック
+
+var state = 'idle';   // idle | pending | drag | scroll | ignore
+var start = null;     // { id, x, y, t }
+var lpTimer = 0;
+var lastTap = { t: 0, x: 0, y: 0, c: 0 };
+var scrollPrev = null, scrollStart = null, scrollMoved = false, samples = [];
+var momentum = null;
+
+function clamp01(v) { return v < 0 ? 0 : v > 0.9999 ? 0.9999 : v; }
+
+function norm(cx, cy) {
+  var r = canvas.getBoundingClientRect();
+  return { x: clamp01((cx - r.left) / r.width), y: clamp01((cy - r.top) / r.height) };
+}
+
+function pxScale() {
+  return canvas.width / canvas.getBoundingClientRect().width;
+}
+
+function mouse(type, cx, cy, b, c) {
+  var p = norm(cx, cy);
+  send({ type: type, x: p.x, y: p.y, b: b || 0, c: c || 1 });
+}
+
+function click(cx, cy, b, c) {
+  mouse('move', cx, cy);
+  mouse('down', cx, cy, b, c);
+  mouse('up', cx, cy, b, c);
+}
+
+function find(list, id) {
+  for (var i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+  return null;
+}
+
+function centroid(list) {
+  var x = 0, y = 0;
+  for (var i = 0; i < list.length; i++) { x += list[i].clientX; y += list[i].clientY; }
+  return { x: x / list.length, y: y / list.length };
+}
+
+function dist(a, b) {
+  var dx = a.x - b.x, dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function showRing(x, y) {
+  ring.style.left = x + 'px';
+  ring.style.top = y + 'px';
+  ring.style.display = 'block';
+  setTimeout(function () { ring.style.display = 'none'; }, 250);
+}
+
+function beginScroll(touches) {
+  clearTimeout(lpTimer);
+  state = 'scroll';
+  scrollStart = scrollPrev = centroid(touches);
+  scrollMoved = false;
+  samples = [];
+  start.t = Date.now();
+}
+
+function stopMomentum() {
+  if (!momentum) return;
+  cancelAnimationFrame(momentum.raf);
+  momentum = null;
+  send({ type: 'scroll', phase: 'mend', dx: 0, dy: 0 });
+}
+
+function startMomentum() {
+  var now = Date.now();
+  var dx = 0, dy = 0, t0 = now;
+  for (var i = 0; i < samples.length; i++) {
+    if (now - samples[i].t > 100) continue;
+    dx += samples[i].dx;
+    dy += samples[i].dy;
+    t0 = Math.min(t0, samples[i].t);
+  }
+  var span = Math.max(now - t0, 16);
+  var vx = dx / span, vy = dy / span;   // 仮想ディスプレイの px/ms
+  if (Math.sqrt(vx * vx + vy * vy) < 0.3) return;
+
+  send({ type: 'scroll', phase: 'mbegin', dx: 0, dy: 0 });
+  var last = performance.now();
+  momentum = { vx: vx, vy: vy, raf: 0 };
+  function step(ts) {
+    if (!momentum) return;
+    var dt = Math.min(ts - last, 50);
+    last = ts;
+    var k = Math.pow(FRICTION, dt);
+    momentum.vx *= k;
+    momentum.vy *= k;
+    send({ type: 'scroll', phase: 'mchange', dx: momentum.vx * dt, dy: momentum.vy * dt });
+    if (Math.sqrt(momentum.vx * momentum.vx + momentum.vy * momentum.vy) < 0.02) {
+      stopMomentum();
+      return;
+    }
+    momentum.raf = requestAnimationFrame(step);
+  }
+  momentum.raf = requestAnimationFrame(step);
+}
+
+// touchend を取りこぼすと（ブラウザが握りつぶした・画面外で離した等）状態が戻らなくなるので、
+// 画面に触れている指がすべて新しい指なら、前のジェスチャーは終わったものとして仕切り直す
+function resetGesture() {
+  clearTimeout(lpTimer);
+  if (state === 'drag') mouse('up', start.x, start.y, 0, 1);
+  if (state === 'scroll' && scrollMoved) send({ type: 'scroll', phase: 'end', dx: 0, dy: 0 });
+  state = 'idle';
+}
+
+canvas.addEventListener('touchstart', function (e) {
+  e.preventDefault();
+  debug('touchstart n=' + e.touches.length + ' state=' + state);
+  stopMomentum();
+  var n = e.touches.length;
+  if (state !== 'idle' && n === e.changedTouches.length) resetGesture();
+
+  if (state === 'idle') {
+    var t = e.changedTouches[0];
+    start = { id: t.identifier, x: t.clientX, y: t.clientY, t: Date.now() };
+    if (n >= 2) {
+      beginScroll(e.touches);
+      return;
+    }
+    state = 'pending';
+    mouse('move', t.clientX, t.clientY);
+    lpTimer = setTimeout(function () {
+      if (state !== 'pending') return;
+      state = 'ignore';
+      click(start.x, start.y, 1, 1);
+      showRing(start.x, start.y);
+    }, LONG_PRESS);
+  } else if (state === 'pending' && n >= 2) {
+    beginScroll(e.touches);
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchmove', function (e) {
+  e.preventDefault();
+  var t0 = e.touches[0];
+  debug('touchmove n=' + e.touches.length + ' state=' + state + ' id=' + (t0 && t0.identifier) +
+        '/' + (start && start.id) + ' at ' + (t0 && Math.round(t0.clientX) + ',' + Math.round(t0.clientY)));
+
+  if (state === 'pending' || state === 'drag') {
+    var t = find(e.touches, start.id);
+    if (!t) return;
+    if (state === 'pending') {
+      if (dist({ x: t.clientX, y: t.clientY }, start) <= TAP_SLOP) return;
+      clearTimeout(lpTimer);
+      state = 'drag';
+      mouse('down', start.x, start.y, 0, 1);
+    }
+    mouse('drag', t.clientX, t.clientY, 0);
+  } else if (state === 'scroll' && e.touches.length >= 2) {
+    var c = centroid(e.touches);
+    if (!scrollMoved) {
+      if (dist(c, scrollStart) <= TAP_SLOP) return;
+      scrollMoved = true;
+      var p = norm(scrollStart.x, scrollStart.y);
+      send({ type: 'scroll', phase: 'begin', dx: 0, dy: 0, x: p.x, y: p.y });
+    }
+    var k = pxScale() * SCROLL_SIGN;
+    var dx = (c.x - scrollPrev.x) * k, dy = (c.y - scrollPrev.y) * k;
+    scrollPrev = c;
+    samples.push({ t: Date.now(), dx: dx, dy: dy });
+    if (samples.length > 20) samples.shift();
+    send({ type: 'scroll', phase: 'change', dx: dx, dy: dy });
+  }
+}, { passive: false });
+
+function onTouchEnd(e) {
+  e.preventDefault();
+  if (awakeVideo && awakeVideo.paused) keepAwake();
+  debug(e.type + ' n=' + e.touches.length + ' state=' + state);
+  var n = e.touches.length;
+
+  if (state === 'pending' && n === 0) {
+    clearTimeout(lpTimer);
+    var now = Date.now();
+    var c = (now - lastTap.t < DOUBLE_TAP && dist(start, lastTap) < 25) ? lastTap.c + 1 : 1;
+    click(start.x, start.y, 0, c);
+    lastTap = { t: now, x: start.x, y: start.y, c: c };
+  } else if (state === 'drag' && find(e.changedTouches, start.id)) {
+    var t = find(e.changedTouches, start.id);
+    mouse('up', t.clientX, t.clientY, 0, 1);
+    state = 'ignore';
+  } else if (state === 'scroll') {
+    if (scrollMoved && n < 2) {
+      send({ type: 'scroll', phase: 'end', dx: 0, dy: 0 });
+      startMomentum();
+      state = 'ignore';
+    } else if (!scrollMoved && n === 0 && Date.now() - start.t < TWO_FINGER_TAP) {
+      click(scrollStart.x, scrollStart.y, 1, 1);
+      showRing(scrollStart.x, scrollStart.y);
+    }
+  }
+
+  if (n === 0) state = 'idle';
+}
+canvas.addEventListener('touchend', onTouchEnd, { passive: false });
+canvas.addEventListener('touchcancel', onTouchEnd, { passive: false });
+
+// ---- 画面を消さない ----
+// Firefox 115 には Screen Wake Lock API がないので、動画の再生中は画面を消さないという
+// Android 版 Firefox の挙動を使う（NoSleep.js と同じ考え方）。小さな無音の動画を流し続ける。
+// ページが表示されている間だけ効き、タブを閉じたり裏に回したりすれば自然に解除される。
+var awakeVideo = null;
+function keepAwake() {
+  if (navigator.wakeLock) {
+    navigator.wakeLock.request('screen').catch(function () {});
+    return;
+  }
+  if (!awakeVideo) {
+    var c = document.createElement('canvas');
+    c.width = c.height = 2;
+    var g = c.getContext('2d');
+    var tick = 0;
+    setInterval(function () {
+      g.fillStyle = (tick++ & 1) ? '#000' : '#010101';
+      g.fillRect(0, 0, 2, 2);
+    }, 1000);
+    awakeVideo = document.createElement('video');
+    awakeVideo.muted = true;
+    awakeVideo.setAttribute('playsinline', '');
+    awakeVideo.srcObject = c.captureStream();
+    awakeVideo.style.cssText = 'position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0.01;pointer-events:none;';
+    document.body.appendChild(awakeVideo);
+  }
+  var p = awakeVideo.play();
+  if (p && p.catch) p.catch(function () {});
+}
+document.addEventListener('visibilitychange', function () {
+  if (!document.hidden) keepAwake();
+});
+
+// ---- 開始 ----
+keepAwake();
+layout();
+lastLandscape = window.innerWidth >= window.innerHeight;
+setLang(lang);
+connect();
+</script>
+</body>
+</html>
