@@ -341,6 +341,11 @@ function beginScroll(touches) {
   start.t = Date.now();
 }
 
+// dx, dy は画像のピクセル。Mac 側の解像度（Retina かどうか）に依らないよう、幅・高さに対する割合で送る
+function sendScroll(phase, dx, dy) {
+  send({ type: 'scroll', phase: phase, dx: dx / canvas.width, dy: dy / canvas.height });
+}
+
 function stopMomentum() {
   if (!momentum) return;
   cancelAnimationFrame(momentum.raf);
@@ -371,7 +376,7 @@ function startMomentum() {
     var k = Math.pow(FRICTION, dt);
     momentum.vx *= k;
     momentum.vy *= k;
-    send({ type: 'scroll', phase: 'mchange', dx: momentum.vx * dt, dy: momentum.vy * dt });
+    sendScroll('mchange', momentum.vx * dt, momentum.vy * dt);
     if (Math.sqrt(momentum.vx * momentum.vx + momentum.vy * momentum.vy) < 0.02) {
       stopMomentum();
       return;
@@ -446,7 +451,7 @@ canvas.addEventListener('touchmove', function (e) {
     scrollPrev = c;
     samples.push({ t: Date.now(), dx: dx, dy: dy });
     if (samples.length > 20) samples.shift();
-    send({ type: 'scroll', phase: 'change', dx: dx, dy: dy });
+    sendScroll('change', dx, dy);
   }
 }, { passive: false });
 

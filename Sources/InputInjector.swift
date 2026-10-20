@@ -7,7 +7,7 @@ import Foundation
 ///
 /// メッセージ（座標 x, y は仮想ディスプレイ内の 0〜1）:
 ///   {type: "move" | "down" | "drag" | "up", x, y, b: 0=左 1=右, c: クリック回数}
-///   {type: "scroll", phase, dx, dy, x?, y?}   dx, dy は仮想ディスプレイ上のピクセル
+///   {type: "scroll", phase, dx, dy, x?, y?}   dx, dy も仮想ディスプレイの幅・高さに対する割合
 ///     phase: begin | change | end | mbegin | mchange | mend（m は慣性スクロール）
 final class InputInjector {
     /// 縦横の切り替えでディスプレイを作り直すと変わる
@@ -68,9 +68,10 @@ final class InputInjector {
             remY = 0
         }
 
-        // 整数ピクセルしか送れないので端数は次回に持ち越す
-        let fx = ((msg["dx"] as? NSNumber)?.doubleValue ?? 0) + remX
-        let fy = ((msg["dy"] as? NSNumber)?.doubleValue ?? 0) + remY
+        // 整数ポイントしか送れないので端数は次回に持ち越す
+        let b = CGDisplayBounds(displayID)
+        let fx = ((msg["dx"] as? NSNumber)?.doubleValue ?? 0) * b.width + remX
+        let fy = ((msg["dy"] as? NSNumber)?.doubleValue ?? 0) * b.height + remY
         let dx = fx.rounded(.towardZero), dy = fy.rounded(.towardZero)
         remX = fx - dx
         remY = fy - dy

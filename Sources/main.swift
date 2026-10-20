@@ -1,29 +1,21 @@
 import AppKit
 import ApplicationServices
-import ScreenCaptureKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    static let port: UInt16 = 7710
+    /// Mac 本体の画面と合わせて最大3画面
+    static let maxTablets = 2
+    /// タブレット側で開くポート。Mac 側はスロットごとに basePort, basePort+1, …
+    static let devicePort: UInt16 = 7710
+    static let basePort: UInt16 = 7710
 
-    private let core = DispatchQueue(label: "tabdisplay.core", qos: .userInteractive)
-    private let screen = VirtualScreen()
-    private lazy var streamer = ScreenStreamer(queue: core)
-    private lazy var server = WebServer(port: Self.port, queue: core, pageURL: Self.pageURL)
-    private lazy var adb = ADBBridge(ports: [Self.port], pageURL: "http://localhost:\(Self.port)/")
-    private let input = InputInjector()
-
+    private let adb = ADBBridge(maxDevices: AppDelegate.maxTablets, devicePort: AppDelegate.devicePort,
+                                basePort: AppDelegate.basePort)
     private var statusItem: NSStatusItem!
     private var signalSources: [DispatchSourceSignal] = []
 
     // main スレッドでのみ触る
-    private var capturing = false
-    private var captureStarting = false
-    private var captureRestartPending = false
-    private var lastCaptureAttempt = Date.distantPast
-    private var clientConnected = false
-    private var reorienting = false
-    private var pendingOrientation: Orientation?
-    private var deviceSerials: [String] = []
+    private var sessions: [Int: TabletSession] = [:]  // スロット → セッション
+    private var overflow = 0
 
     /// "auto" | "landscape" | "portrait"
     private var orientationSetting: String {
@@ -44,37 +36,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
         }
 
-        wireUp()
-        do {
-            try server.start()
-        } catch {
-            Log.write("server start failed: \(error)")
-        }
-
-        // 「タブレットに合わせる」のときは前回の向きで作る（縦のまま起動したときに作り直さずに済む）
-        let initial = Orientation(rawValue: orientationSetting)
-            ?? UserDefaults.standard.string(forKey: "lastOrientation").flatMap(Orientation.init)
-            ?? .landscape
-        screen.create(initial) { _ in
-            guard self.screen.displayID != kCGNullDirectDisplay else {
-                let alert = NSAlert()
-                alert.messageText = tr("Could not create the virtual display",
-                                       ja: "仮想ディスプレイを作成できませんでした",
-                                       zh: "无法创建虚拟显示器",
-                                       es: "No se pudo crear la pantalla virtual")
-                alert.runModal()
-                NSApp.terminate(nil)
-                return
-            }
-            self.displayCreated()
-        }
+        adb.onAdded = { [weak self] slot, info in self?.addSession(slot, info) }
+        adb.onRemoved = { [weak self] slot in self?.removeSession(slot) }
+        adb.onOverflow = { [weak self] count in self?.overflow = count }
         adb.start()
+
+        // 2台目がなくても試せるように、仮のタブレットを足せる（ページは Mac のブラウザで http://localhost:7711 を開く）
+        //   defaults write local.soma.tabdisplay testTablet "1920x1200@240"
+        if let spec = UserDefaults.standard.string(forKey: "testTablet") {
+            let n = spec.split(whereSeparator: { "x@".contains($0) }).compactMap { Int($0) }
+            if n.count == 3 {
+                adb.addTestDevice(TabletInfo(id: "test-\(spec)", model: "Test", width: n[0], height: n[1], density: n[2]))
+            }
+        }
 
         // 画面収録の許可が後から付いた場合や、キャプチャが止まった場合に再開する
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            guard let self, !self.capturing, !self.captureStarting, !self.reorienting,
-                  Date().timeIntervalSince(self.lastCaptureAttempt) > 10 else { return }
-            self.startCapture()
+            self?.sessions.values.forEach { $0.tick() }
         }
 
         for sig in [SIGINT, SIGTERM] {
@@ -91,110 +69,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         adb.teardown()
     }
 
-    private func wireUp() {
-        streamer.send = { [weak self] data in self?.server.sendBinary(data) }
-        streamer.onStop = { [weak self] _ in self?.capturing = false }
+    // MARK: - タブレット
 
-        server.onConnect = { [weak self] in
-            guard let self else { return }
-            self.streamer.clientConnected()
-            self.server.sendText(Self.languageMessage())
-            DispatchQueue.main.async { self.clientConnected = true }
-        }
-        server.onDisconnect = { [weak self] in
-            guard let self else { return }
-            self.streamer.clientDisconnected()
-            DispatchQueue.main.async { self.clientConnected = false }
-        }
-        server.onText = { [weak self] text in
-            guard let self else { return }
-            if text == "a" {
-                self.streamer.ack()
-                return
-            }
-            guard let data = text.data(using: .utf8),
-                  let msg = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
-            if msg["type"] as? String == "hello" {
-                let landscape = msg["landscape"] as? Bool ?? true
-                DispatchQueue.main.async { self.clientOrientation(landscape ? .landscape : .portrait) }
-            } else {
-                self.input.handle(msg)
-            }
-        }
+    private func addSession(_ slot: Int, _ info: TabletInfo) {
+        sessions[slot]?.stop()
+        let session = TabletSession(slot: slot, info: info, port: Self.basePort + UInt16(slot), pageURL: Self.pageURL,
+                                    orientationSetting: { [weak self] in self?.orientationSetting ?? "auto" })
+        sessions[slot] = session
+        session.onConnectionChanged = { [weak self] connected in self?.adb.setConnected(slot, connected) }
+        session.start()
 
-        adb.isClientConnected = { [weak self] in
-            guard let self else { return false }
-            return self.core.sync { self.server.client != nil }
-        }
-        adb.onDevicesChanged = { [weak self] serials in
-            DispatchQueue.main.async { self?.deviceSerials = serials }
+        // ページを開いたままなら自動で再接続してくるので、来なかったときだけブラウザで開く
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self, weak session] in
+            guard let self, let session, self.sessions[slot] === session, !session.isClientConnected else { return }
+            self.adb.openBrowser(slot: slot)
         }
     }
 
-    // MARK: - キャプチャ・向き
-
-    private func startCapture() {
-        guard CGPreflightScreenCaptureAccess() else { return }
-        guard !captureStarting else {
-            captureRestartPending = true
-            return
-        }
-        captureStarting = true
-        lastCaptureAttempt = Date()
-        let id = screen.displayID
-        let size = screen.pixelSize
-        Task { @MainActor in
-            do {
-                try await self.streamer.start(displayID: id, width: size.width, height: size.height)
-                self.capturing = true
-            } catch {
-                self.capturing = false
-                Log.write("capture start failed: \(error.localizedDescription)")
-            }
-            self.captureStarting = false
-            if self.captureRestartPending {
-                self.captureRestartPending = false
-                self.startCapture()
-            }
-        }
-    }
-
-    private func displayCreated() {
-        let id = screen.displayID
-        UserDefaults.standard.set(screen.orientation.rawValue, forKey: "lastOrientation")
-        core.async { self.input.displayID = id }
-        // モードの切り替えが落ち着いてからキャプチャを始める
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.startCapture() }
-    }
-
-    /// 縦横を変えるときはディスプレイを作り直す（VirtualScreen 参照）。
-    /// 作り直している最中に別の向きが来たら、終わってからその向きにする。
-    private func reorient(_ o: Orientation) {
-        guard !reorienting else {
-            pendingOrientation = o
-            return
-        }
-        guard o != screen.orientation else { return }
-        reorienting = true
-        Log.write("reorient: \(o.rawValue)")
-        Task { @MainActor in
-            await self.streamer.stop()
-            self.capturing = false
-            self.screen.create(o) { _ in
-                self.reorienting = false
-                if self.screen.displayID != kCGNullDirectDisplay { self.displayCreated() }
-                if let next = self.pendingOrientation {
-                    self.pendingOrientation = nil
-                    self.reorient(next)
-                }
-            }
-        }
-    }
-
-    private func clientOrientation(_ o: Orientation) {
-        guard orientationSetting == "auto", o != screen.orientation else { return }
-        Log.write("tablet orientation: \(o.rawValue)")
-        reorient(o)
+    private func removeSession(_ slot: Int) {
+        adb.setConnected(slot, false)
+        sessions[slot]?.stop()
+        sessions[slot] = nil
     }
 
     // MARK: - メニュー
@@ -209,13 +104,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.isEnabled = false
             menu.addItem(item)
         }
-        func action(_ title: String, _ selector: Selector, _ key: String = "") -> NSMenuItem {
+        func action(_ title: String, _ selector: Selector, _ key: String = "") {
             let item = NSMenuItem(title: title, action: selector, keyEquivalent: key)
             item.target = self
             menu.addItem(item)
-            return item
         }
-
         func submenu(_ title: String, _ items: [(title: String, value: String, on: Bool)], _ selector: Selector) {
             let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             let sub = NSMenu()
@@ -230,17 +123,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(parent)
         }
 
-        info(deviceSerials.isEmpty
-             ? tr("Tablet: not connected", ja: "タブレット: 未接続", zh: "平板：未连接", es: "Tableta: no conectada")
-             : tr("Tablet: connected", ja: "タブレット: 接続中", zh: "平板：已连接", es: "Tableta: conectada"))
-        info(clientConnected
-             ? tr("Display: streaming", ja: "表示: 送信中", zh: "显示：正在传输", es: "Pantalla: transmitiendo")
-             : tr("Display: page not connected", ja: "表示: ページ未接続", zh: "显示：页面未连接", es: "Pantalla: página no conectada"))
+        if sessions.isEmpty {
+            info(tr("No tablet connected", ja: "タブレット未接続", zh: "未连接平板", es: "Ninguna tableta conectada"))
+        }
+        for session in sessions.keys.sorted().compactMap({ sessions[$0] }) {
+            let state: String
+            if screenOK && !session.capturing {
+                state = tr("capture stopped", ja: "キャプチャ停止中", zh: "捕获已停止", es: "captura detenida")
+            } else if session.clientConnected {
+                state = tr("streaming", ja: "送信中", zh: "正在传输", es: "transmitiendo")
+            } else {
+                state = tr("page not connected", ja: "ページ未接続", zh: "页面未连接", es: "página no conectada")
+            }
+            info("\(session.info.model) — \(session.sizeDescription) — \(state)")
+        }
+        if overflow > 0 {
+            info(tr("⚠️ Up to \(Self.maxTablets) tablets can be used", ja: "⚠️ 使えるタブレットは\(Self.maxTablets)台までです",
+                    zh: "⚠️ 最多可使用 \(Self.maxTablets) 台平板", es: "⚠️ Se pueden usar hasta \(Self.maxTablets) tabletas"))
+        }
         if !screenOK {
             info(tr("⚠️ Screen Recording is not allowed", ja: "⚠️ 画面収録が許可されていません",
                     zh: "⚠️ 未允许屏幕录制", es: "⚠️ La grabación de pantalla no está permitida"))
-        } else if !capturing {
-            info(tr("⚠️ Capture stopped", ja: "⚠️ キャプチャ停止中", zh: "⚠️ 捕获已停止", es: "⚠️ Captura detenida"))
         }
         if !inputOK {
             info(tr("⚠️ Accessibility is not allowed (needed for touch)",
@@ -250,8 +153,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
-        _ = action(tr("Open Page on Tablet", ja: "タブレットでページを開く", zh: "在平板上打开页面", es: "Abrir la página en la tableta"),
-                   #selector(openOnTablet))
+        action(tr("Open Page on Tablets", ja: "タブレットでページを開く", zh: "在平板上打开页面", es: "Abrir la página en las tabletas"),
+               #selector(openOnTablets))
         submenu(tr("Orientation", ja: "向き", zh: "方向", es: "Orientación"), [
             (tr("Match Tablet", ja: "タブレットに合わせる", zh: "跟随平板", es: "Según la tableta"), "auto", orientationSetting == "auto"),
             (tr("Landscape", ja: "横", zh: "横向", es: "Horizontal"), "landscape", orientationSetting == "landscape"),
@@ -260,45 +163,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         submenu(tr("Language", ja: "言語", zh: "语言", es: "Idioma"),
                 Language.allCases.map { ($0.nativeName, $0.rawValue, $0 == Language.current) },
                 #selector(setLanguage(_:)))
-        _ = action(tr("Open Display Settings…", ja: "ディスプレイ設定を開く…", zh: "打开显示器设置…", es: "Abrir ajustes de pantallas…"),
-                   #selector(openDisplaySettings))
+        action(tr("Open Display Settings…", ja: "ディスプレイ設定を開く…", zh: "打开显示器设置…", es: "Abrir ajustes de pantallas…"),
+               #selector(openDisplaySettings))
         if !screenOK {
-            _ = action(tr("Open Screen Recording Settings…", ja: "画面収録の設定を開く…",
-                          zh: "打开屏幕录制设置…", es: "Abrir ajustes de grabación de pantalla…"),
-                       #selector(openScreenCaptureSettings))
+            action(tr("Open Screen Recording Settings…", ja: "画面収録の設定を開く…",
+                      zh: "打开屏幕录制设置…", es: "Abrir ajustes de grabación de pantalla…"),
+                   #selector(openScreenCaptureSettings))
         }
         if !inputOK {
-            _ = action(tr("Open Accessibility Settings…", ja: "アクセシビリティの設定を開く…",
-                          zh: "打开辅助功能设置…", es: "Abrir ajustes de accesibilidad…"),
-                       #selector(openAccessibilitySettings))
+            action(tr("Open Accessibility Settings…", ja: "アクセシビリティの設定を開く…",
+                      zh: "打开辅助功能设置…", es: "Abrir ajustes de accesibilidad…"),
+                   #selector(openAccessibilitySettings))
         }
-        _ = action(tr("Restart", ja: "再起動", zh: "重新启动", es: "Reiniciar"), #selector(relaunch))
+        action(tr("Restart", ja: "再起動", zh: "重新启动", es: "Reiniciar"), #selector(relaunch))
         menu.addItem(.separator())
-        _ = action(tr("Quit", ja: "終了", zh: "退出", es: "Salir"), #selector(quit), "q")
+        action(tr("Quit", ja: "終了", zh: "退出", es: "Salir"), #selector(quit), "q")
+    }
+
+    @objc private func openOnTablets() { adb.openBrowser() }
+
+    @objc private func setOrientationSetting(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String else { return }
+        orientationSetting = value
+        sessions.values.forEach { $0.applyOrientationSetting() }
     }
 
     @objc private func setLanguage(_ sender: NSMenuItem) {
         guard let value = sender.representedObject as? String, let lang = Language(rawValue: value) else { return }
         Language.current = lang
-        let message = Self.languageMessage()
-        core.async { self.server.sendText(message) }
-    }
-
-    /// タブレットのページに表示言語を伝える
-    private static func languageMessage() -> String {
-        "{\"type\":\"lang\",\"lang\":\"\(Language.current.rawValue)\"}"
-    }
-
-    @objc private func openOnTablet() { adb.openBrowser() }
-
-    @objc private func setOrientationSetting(_ sender: NSMenuItem) {
-        guard let value = sender.representedObject as? String else { return }
-        orientationSetting = value
-        switch value {
-        case "landscape": reorient(.landscape)
-        case "portrait": reorient(.portrait)
-        default: break  // 次にタブレットから向きが届いたときに合わせる
-        }
+        sessions.values.forEach { $0.sendLanguage() }
     }
 
     @objc private func openDisplaySettings() {

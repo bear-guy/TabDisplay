@@ -44,6 +44,15 @@ final class WebServer {
         listener = l
     }
 
+    func stop() {
+        queue.async {
+            self.listener?.cancel()
+            self.listener = nil
+            self.client?.cancel()
+            self.client = nil
+        }
+    }
+
     func sendBinary(_ data: Data) {
         client?.send(content: Self.frame(opcode: 0x2, data), completion: .contentProcessed { _ in })
     }

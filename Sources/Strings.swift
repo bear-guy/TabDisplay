@@ -18,6 +18,11 @@ enum Language: String, CaseIterable {
         get { UserDefaults.standard.string(forKey: "language").flatMap(Language.init) ?? .en }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "language") }
     }
+
+    /// タブレットのページに表示言語を伝えるメッセージ
+    static var pageMessage: String {
+        "{\"type\":\"lang\",\"lang\":\"\(current.rawValue)\"}"
+    }
 }
 
 /// 現在の言語の文言を返す。文言は呼び出し側に並べて書く。

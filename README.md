@@ -1,20 +1,23 @@
 # TabDisplay — Android タブレットを Mac のサブモニターにする
 
 USB でつないだ Android タブレットを、Mac の拡張ディスプレイとして使うメニューバーアプリ。タッチ操作にも対応している。
+タブレットは2台まで同時に使える（Mac 本体の画面と合わせて最大3画面）。
 タブレット側はブラウザでページを開くだけで、専用アプリのインストールは要らない。
 
 ```
-Mac                                              タブレット (ブラウザ)
-┌──────────────────────────────┐   USB (adb reverse)   ┌───────────────────┐
-│ CGVirtualDisplay 1280x800    │                       │ http://localhost:7710
-│   ↓ ScreenCaptureKit         │ ── JPEG(変化領域) ──▶ │   canvas に描画    │
-│   ↓ JPEG                     │                       │                   │
-│ WebSocket :7710 (127.0.0.1)  │ ◀── タッチ操作 ────── │   ジェスチャー判定 │
-│   ↓ CGEvent (マウス/スクロール)│                       │                   │
-└──────────────────────────────┘                       └───────────────────┘
+Mac                                                タブレット (ブラウザ)
+┌────────────────────────────────┐  USB (adb reverse)  ┌──────────────────────┐
+│ タブレットごとに                 │                     │ http://localhost:7710 │
+│  CGVirtualDisplay（画面に合わせる）│                     │                      │
+│   ↓ ScreenCaptureKit            │ ─ JPEG(変化領域) ─▶ │   canvas に描画       │
+│   ↓ JPEG                        │                     │                      │
+│  WebSocket :7710 / :7711        │ ◀── タッチ操作 ──── │   ジェスチャー判定    │
+│   ↓ CGEvent (マウス/スクロール)   │                     │                      │
+└────────────────────────────────┘                     └──────────────────────┘
 ```
 
-Mac 側のサーバーは 127.0.0.1 にしか bind しないので、同じネットワークの他の端末から画面を見られたり操作されたりすることはない。タブレットからは adb reverse で USB 経由でつなぐ。
+どのタブレットも `http://localhost:7710` を開く。adb reverse で、1台目は Mac の 7710、2台目は 7711 につなぐので、Mac 側は受けたポートでどのタブレットかを見分けられる。
+Mac 側のサーバーは 127.0.0.1 にしか bind しないので、同じネットワークの他の端末から画面を見られたり操作されたりすることはない。
 
 ## 必要なもの
 
@@ -38,14 +41,28 @@ Mac 側のサーバーは 127.0.0.1 にしか bind しないので、同じネ�
 
 ## 使い方
 
-1. タブレットを USB でつなぐ
-2. `open build/TabDisplay.app`
-   - メニューバーにアイコンが出て、Mac にディスプレイが1枚追加される
-   - タブレットの Firefox でページが自動で開く（開かなければメニューの「Open Page on Tablet」）
+1. `open build/TabDisplay.app`（メニューバーにアイコンが出る）
+2. タブレットを USB でつなぐ（2台までいつでも抜き差しできる）
+   - タブレットごとに、Mac に「〈機種名〉 (TabDisplay)」というディスプレイが追加される
+   - タブレットの Firefox でページが自動で開く（開かなければメニューの「Open Page on Tablets」）
 3. タブレットで「Tap to start in full screen」をタップ
 4. 終了はメニューバーのアイコン →「Quit」。仮想ディスプレイも消える
 
-ディスプレイの左右の配置は「システム設定 → ディスプレイ」で変えられる（次回以降も記憶される）。
+タブレットを抜くと、10秒後にそのディスプレイが消える（ケーブルの接触などで一瞬切れただけなら消えない）。
+3台目以降をつないでも無視され、メニューに「Up to 2 tablets can be used」と出る。
+
+ディスプレイの左右の配置は「システム設定 → ディスプレイ」で変えられる。配置はタブレットごと・向きごとに記憶される。
+
+## 2台目がなくても試す
+
+adb を通さない仮のタブレットを足せる。ページは Mac のブラウザで開く（2台目なら `http://localhost:7711`）。
+
+```sh
+defaults write local.soma.tabdisplay testTablet "1920x1200@240"   # 幅x高さ@密度
+defaults delete local.soma.tabdisplay testTablet                  # 元に戻す
+```
+
+アプリの再起動で反映される。
 
 ## タッチ操作
 
@@ -61,9 +78,16 @@ Mac 側のサーバーは 127.0.0.1 にしか bind しないので、同じネ�
 
 ## 解像度と向き
 
-仮想ディスプレイは横向き 1280×800、縦向き 800×1280 で作る。
-比率の違うタブレットでは、上下または左右に黒い帯が出る。
-解像度を変えるときは `Sources/VirtualScreen.swift` の `longSide` / `shortSide` を変えて再ビルドする。
+仮想ディスプレイの大きさは、つないだタブレットの画面（adb の `wm size` / `wm density`）から自動で決める。
+Mac 上での大きさは、Android の dp と同じ（＝タブレットでのアプリの見た目と同じくらいの大きさ）にしている。
+
+| タブレットの画面 | Mac 上の大きさ | 描き方 |
+|---|---|---|
+| 1280×800・160dpi | 1280×800 | そのまま（1x） |
+| 1920×1200・240dpi | 1280×800 | Retina（2x）で描いて 1920×1200 に縮小 |
+| 2560×1600・320dpi | 1280×800 | Retina（2x）で描いてそのまま |
+
+160dpi より高密度の画面は Retina で描くので、文字がくっきり表示される。
 
 タブレットを縦にすると、Mac 側のディスプレイも縦長に切り替わる（1〜2秒）。
 メニューバーの「Orientation」で、横・縦に固定することもできる。
@@ -123,11 +147,12 @@ defaults write local.soma.tabdisplay fullFramesOnly -bool true # 変化領域だ
 ## ファイル
 
 - `Sources/VirtualDisplay.h` — CoreGraphics の非公開 API `CGVirtualDisplay` の宣言
-- `Sources/VirtualScreen.swift` — 仮想ディスプレイの作成（縦横を変えるときは作り直す）
+- `Sources/TabletSession.swift` — タブレット1台ぶんの仮想ディスプレイ・キャプチャ・通信・入力
+- `Sources/VirtualScreen.swift` — 仮想ディスプレイの作成（タブレットの画面に合わせる。縦横を変えるときは作り直す）
 - `Sources/ScreenStreamer.swift` — キャプチャ、JPEG 化、送信の流量制御
 - `Sources/WebServer.swift` — HTTP と WebSocket（自前実装）
 - `Sources/InputInjector.swift` — タッチをマウス・スクロールイベントとして注入
-- `Sources/ADBBridge.swift` — 端末の検出、adb reverse、画面点灯の維持、ページを開く
+- `Sources/ADBBridge.swift` — 端末の検出と台数の管理、adb reverse、画面点灯の維持、ページを開く
 - `Sources/Strings.swift` — 表示言語
 - `Sources/main.swift` — メニューバーアプリ本体
 - `web/index.html` — タブレット側のページ
