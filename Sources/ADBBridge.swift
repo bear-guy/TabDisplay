@@ -214,10 +214,17 @@ final class ADBBridge {
         adb("-s", serial, "reverse", "tcp:\(devicePort)", "tcp:\(basePort + UInt16(slot))")
     }
 
+    /// Firefox が入っていれば Firefox で、なければ端末の普段のブラウザで開く
     private func launchBrowser(_ serial: String) {
         let url = "http://localhost:\(devicePort)/"
-        Log.write("open \(url) on \(serial)")
-        adb("-s", serial, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url, "org.mozilla.firefox")
+        let firefox = "org.mozilla.firefox"
+        let hasFirefox = adb("-s", serial, "shell", "pm", "path", firefox).hasPrefix("package:")
+        Log.write("open \(url) on \(serial)" + (hasFirefox ? "" : " (default browser)"))
+        if hasFirefox {
+            adb("-s", serial, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url, firefox)
+        } else {
+            adb("-s", serial, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url)
+        }
     }
 
     private func prop(_ serial: String, _ name: String) -> String {

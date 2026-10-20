@@ -24,7 +24,7 @@ Mac 側のサーバーは 127.0.0.1 にしか bind しないので、同じネ�
 - **Mac**: Apple Silicon、macOS 14 以降
 - **adb**: `brew install android-platform-tools`
 - **Android タブレット**: Android 5.0 以降（adb reverse に必要）、USB デバッグを有効にしておく
-- **タブレットのブラウザ**: Firefox を推奨（ページを自動で開くのは Firefox）。他のブラウザでも `http://localhost:7710` を開けば使える可能性があるが、未確認
+- **タブレットのブラウザ**: Firefox を推奨（入っていればページは Firefox で自動で開き、なければ普段のブラウザで開く）。他のブラウザでも `http://localhost:7710` を開けば使える可能性があるが、未確認
 
 動作確認: Android 5.1・1280×800 のタブレット + Firefox 115、macOS 27（Apple Silicon）
 
@@ -44,7 +44,7 @@ Mac 側のサーバーは 127.0.0.1 にしか bind しないので、同じネ�
 1. `open build/TabDisplay.app`（メニューバーにアイコンが出る）
 2. タブレットを USB でつなぐ（2台までいつでも抜き差しできる）
    - タブレットごとに、Mac に「〈機種名〉 (TabDisplay)」というディスプレイが追加される
-   - タブレットの Firefox でページが自動で開く（開かなければメニューの「Open Page on Tablets」）
+   - タブレットのブラウザでページが自動で開く（開かなければメニューの「Open Page on Tablets」）
 3. タブレットで「Tap to start in full screen」をタップ
 4. 終了はメニューバーのアイコン →「Quit」。仮想ディスプレイも消える
 
